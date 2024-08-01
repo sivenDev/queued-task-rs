@@ -21,7 +21,7 @@ repository = "https://github.com/zhengxiwan/queued-task-rs"
 
 [dependencies]
 #derive_builder = "0.20.0"
-tracing = "0.1"
+#tracing = "0.1"
 tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
 
 
