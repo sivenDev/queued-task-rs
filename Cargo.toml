@@ -3,6 +3,22 @@ name = "queued-task"
 version = "0.1.0"
 edition = "2021"
 
+rust-version = "1.70"
+authors = ["siven <sivenzheng@gmail.com>"]
+description = """
+concurrent queue task processing
+"""
+readme = "README.MD"
+keywords = [
+    "task",
+    "async",
+    "queue",
+    "concurrent",
+]
+license = "MIT"
+repository = "https://github.com/zhengxiwan/queued-task-rs"
+
+
 [dependencies]
 #derive_builder = "0.20.0"
 tracing = "0.1"
