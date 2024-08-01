@@ -1,0 +1,8 @@
+.idea
+target
+build
+temp
+.temp
+cmake-*
+*.log
+.vscode/
