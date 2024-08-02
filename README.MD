@@ -28,6 +28,7 @@ queued-task = "0.1.0"
     
     #[tokio::test]
     async fn test() {
+        // 10 queue_len, 2 process rate
         let t = Arc::new(QueuedTaskBuilder::new(10, 2).handle(handle).build());
 
         async fn handle(wait_time: Duration, c: usize) -> usize {
