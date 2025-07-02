@@ -1,6 +1,6 @@
 [package]
 name = "queued-task"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 rust-version = "1.70"
@@ -23,7 +23,7 @@ repository = "https://github.com/zhengxiwan/queued-task-rs"
 #derive_builder = "0.20.0"
 #tracing = "0.1"
 tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
-
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }

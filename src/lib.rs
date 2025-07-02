@@ -7,6 +7,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Mutex};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
+use tracing::{Instrument, Span};
 
 struct Shared<R> {
     notify: Arc<Notify>,
@@ -45,6 +46,7 @@ pub struct Task<T, R> {
     inner: T,
     shared: Shared<R>,
     start_time: Instant,
+    span: Span,
 }
 
 impl<T, R> Task<T, R> {
@@ -53,6 +55,7 @@ impl<T, R> Task<T, R> {
             inner,
             shared,
             start_time: Instant::now(),
+            span: Span::current(),
         }
     }
 }
@@ -157,13 +160,14 @@ where
                 inner,
                 shared,
                 start_time,
+                span,
             }) = receiver.recv().await
             {
                 let p = arc_sem.clone().acquire_owned().await.unwrap();
                 let h = arc_handle.clone();
                 tokio::spawn(async move {
                     let wait = start_time.elapsed();
-                    let result = h(wait, inner).await;
+                    let result = h(wait, inner).instrument(span).await;
                     shared.set_result(result).await;
                     drop(p)
                 });
