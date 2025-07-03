@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Mutex};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
-use tracing::Span;
+use tracing::{Instrument, Span};
 
 struct Shared<R> {
     notify: Arc<Notify>,
@@ -196,7 +196,9 @@ where
                     Some(span) => {
                         tokio::spawn(async move {
                             let wait = start_time.elapsed();
-                            let result = span.in_scope(|| async { h(wait, inner).await }).await;
+                            let result = span
+                                .in_scope(|| async { h(wait, inner).await }.in_current_span())
+                                .await;
                             shared.set_result(result).await;
                             drop(p);
                         });
