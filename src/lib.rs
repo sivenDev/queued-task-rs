@@ -195,9 +195,8 @@ where
                     }
                     Some(span) => {
                         tokio::spawn(async move {
-                            let _enter = span.enter();
                             let wait = start_time.elapsed();
-                            let result = h(wait, inner).await;
+                            let result = span.in_scope(|| async { h(wait, inner).await }).await;
                             shared.set_result(result).await;
                             drop(p);
                         });
