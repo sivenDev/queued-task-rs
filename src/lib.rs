@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Mutex};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
-use tracing::{Instrument, Span};
+use tracing::Span;
 
 struct Shared<R> {
     notify: Arc<Notify>,
@@ -46,16 +46,16 @@ pub struct Task<T, R> {
     inner: T,
     shared: Shared<R>,
     start_time: Instant,
-    span: Span,
+    span: Option<Span>,
 }
 
 impl<T, R> Task<T, R> {
-    fn new(inner: T, shared: Shared<R>) -> Self {
+    fn new(inner: T, shared: Shared<R>, span: Option<Span>) -> Self {
         Self {
             inner,
             shared,
             start_time: Instant::now(),
-            span: Span::current(),
+            span,
         }
     }
 }
@@ -95,19 +95,38 @@ impl<T, R> QueuedTask<T, R> {
     }
 
     pub async fn push(&self, inner: T) -> Result<TaskState<R>, SendError<Task<T, R>>> {
+        self.push_with_span(inner, None).await
+    }
+
+    pub async fn push_with_span(
+        &self,
+        inner: T,
+        span: Option<Span>,
+    ) -> Result<TaskState<R>, SendError<Task<T, R>>> {
         let shared = Shared::new();
-        self.sender.send(Task::new(inner, shared.clone())).await?;
+        self.sender
+            .send(Task::new(inner, shared.clone(), span))
+            .await?;
         Ok(TaskState { shared })
     }
 
     pub async fn push_timeout(
         &self,
         inner: T,
+        timeout: Duration,
+    ) -> Result<TaskState<R>, SendTimeoutError<Task<T, R>>> {
+        self.push_timeout_with_span(inner, timeout, None).await
+    }
+
+    pub async fn push_timeout_with_span(
+        &self,
+        inner: T,
         time_out: Duration,
+        span: Option<Span>,
     ) -> Result<TaskState<R>, SendTimeoutError<Task<T, R>>> {
         let shared = Shared::new();
         self.sender
-            .send_timeout(Task::new(inner, shared.clone()), time_out)
+            .send_timeout(Task::new(inner, shared.clone(), span), time_out)
             .await?;
         Ok(TaskState { shared })
     }
@@ -165,12 +184,25 @@ where
             {
                 let p = arc_sem.clone().acquire_owned().await.unwrap();
                 let h = arc_handle.clone();
-                tokio::spawn(async move {
-                    let wait = start_time.elapsed();
-                    let result = h(wait, inner).instrument(span).await;
-                    shared.set_result(result).await;
-                    drop(p)
-                });
+                match span {
+                    None => {
+                        tokio::spawn(async move {
+                            let wait = start_time.elapsed();
+                            let result = h(wait, inner).await;
+                            shared.set_result(result).await;
+                            drop(p)
+                        });
+                    }
+                    Some(span) => {
+                        tokio::spawn(async move {
+                            let _enter = span.enter();
+                            let wait = start_time.elapsed();
+                            let result = h(wait, inner).await;
+                            shared.set_result(result).await;
+                            drop(p);
+                        });
+                    }
+                }
             }
         });
         QueuedTask { sender }
