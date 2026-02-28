@@ -4,53 +4,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::error::{SendError, SendTimeoutError};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, Mutex};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::time::Instant;
 use tracing::{Instrument, Span};
 
-struct Shared<R> {
-    notify: Arc<Notify>,
-    data: Arc<Mutex<Option<R>>>,
-}
-
-impl<R> Clone for Shared<R> {
-    fn clone(&self) -> Self {
-        Self {
-            notify: self.notify.clone(),
-            data: self.data.clone(),
-        }
-    }
-}
-
-impl<R> Shared<R> {
-    fn new() -> Self {
-        Self {
-            notify: Arc::new(Notify::new()),
-            data: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    async fn set_result(self, result: R) {
-        self.data.lock().await.replace(result);
-        self.notify.notify_one();
-    }
-
-    async fn wait_result(self) -> Option<R> {
-        self.notify.notified().await;
-        self.data.lock().await.take()
-    }
+/// Internal shared state for task results.
+/// Replaces the manual `Shared` implementation with a more direct Arc-wrapped struct.
+struct InnerShared<R> {
+    data: tokio::sync::Mutex<Option<R>>,
+    notify: Notify,
 }
 
 pub struct Task<T, R> {
     inner: T,
-    shared: Shared<R>,
+    shared: Arc<InnerShared<R>>,
     start_time: Instant,
     span: Option<Span>,
 }
 
 impl<T, R> Task<T, R> {
-    fn new(inner: T, shared: Shared<R>, span: Option<Span>) -> Self {
+    fn new(inner: T, shared: Arc<InnerShared<R>>, span: Option<Span>) -> Self {
         Self {
             inner,
             shared,
@@ -61,29 +34,16 @@ impl<T, R> Task<T, R> {
 }
 
 pub struct TaskState<R> {
-    shared: Shared<R>,
+    shared: Arc<InnerShared<R>>,
 }
 
 impl<R> TaskState<R> {
+    /// Wait for the task to complete and return the result.
     pub async fn wait_result(self) -> Option<R> {
-        self.shared.wait_result().await
+        self.shared.notify.notified().await;
+        self.shared.data.lock().await.take()
     }
 }
-
-// #[derive(Debug)]
-// pub struct Config {
-//     length: usize,
-//     keep_alive_timeout: Duration,
-// }
-//
-// impl Default for Config {
-//     fn default() -> Self {
-//         Self {
-//             length: 16,
-//             keep_alive_timeout: Duration::from_secs(30),
-//         }
-//     }
-// }
 
 pub struct QueuedTask<T, R> {
     sender: Sender<Task<T, R>>,
@@ -103,7 +63,10 @@ impl<T, R> QueuedTask<T, R> {
         inner: T,
         span: Option<Span>,
     ) -> Result<TaskState<R>, SendError<Task<T, R>>> {
-        let shared = Shared::new();
+        let shared = Arc::new(InnerShared {
+            data: tokio::sync::Mutex::new(None),
+            notify: Notify::new(),
+        });
         self.sender
             .send(Task::new(inner, shared.clone(), span))
             .await?;
@@ -124,7 +87,10 @@ impl<T, R> QueuedTask<T, R> {
         time_out: Duration,
         span: Option<Span>,
     ) -> Result<TaskState<R>, SendTimeoutError<Task<T, R>>> {
-        let shared = Shared::new();
+        let shared = Arc::new(InnerShared {
+            data: tokio::sync::Mutex::new(None),
+            notify: Notify::new(),
+        });
         self.sender
             .send_timeout(Task::new(inner, shared.clone(), span), time_out)
             .await?;
@@ -133,11 +99,9 @@ impl<T, R> QueuedTask<T, R> {
 }
 
 pub struct QueuedTaskBuilder<F, T, R> {
-    // config: Config,
     handle: Option<F>,
-    sem: Semaphore,
-    sender: Sender<Task<T, R>>,
-    receiver: Receiver<Task<T, R>>,
+    queue_len: usize,
+    rate: usize,
 }
 
 impl<F, T, Fut, R> QueuedTaskBuilder<F, T, R>
@@ -148,13 +112,10 @@ where
     R: Send + 'static,
 {
     pub fn new(queue_len: usize, rate: usize) -> Self {
-        let (sender, receiver) = mpsc::channel(queue_len);
         Self {
-            // config,
-            sem: Semaphore::new(rate),
             handle: None,
-            sender,
-            receiver,
+            queue_len,
+            rate,
         }
     }
 
@@ -164,48 +125,36 @@ where
     }
 
     pub fn build(self) -> QueuedTask<T, R> {
-        let Self {
-            sem,
-            mut handle,
-            sender,
-            mut receiver,
-            ..
-        } = self;
-        let handle = handle.take().unwrap();
+        let (sender, mut receiver) = mpsc::channel(self.queue_len);
+        let handle = Arc::new(self.handle.expect("handle must be set"));
+        let sem = Arc::new(Semaphore::new(self.rate));
+
         tokio::spawn(async move {
-            let arc_sem = Arc::new(sem);
-            let arc_handle = Arc::new(handle);
-            while let Some(Task {
-                inner,
-                shared,
-                start_time,
-                span,
-            }) = receiver.recv().await
-            {
-                let p = arc_sem.clone().acquire_owned().await.unwrap();
-                let h = arc_handle.clone();
-                match span {
-                    None => {
-                        tokio::spawn(async move {
-                            let wait = start_time.elapsed();
-                            let result = h(wait, inner).await;
-                            shared.set_result(result).await;
-                            drop(p)
-                        });
-                    }
-                    Some(span) => {
-                        tokio::spawn(async move {
-                            let wait = start_time.elapsed();
-                            let result = span
-                                .in_scope(|| async { h(wait, inner).await }.in_current_span())
-                                .await;
-                            shared.set_result(result).await;
-                            drop(p);
-                        });
-                    }
-                }
+            while let Some(task) = receiver.recv().await {
+                // Correct semaphore usage: acquire permit before spawning task execution.
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                
+                let h = handle.clone();
+                let Task { inner, shared, start_time, span } = task;
+
+                tokio::spawn(async move {
+                    let wait = start_time.elapsed();
+                    let result = match span {
+                        Some(s) => h(wait, inner).instrument(s).await,
+                        None => h(wait, inner).await,
+                    };
+
+                    let mut data = shared.data.lock().await;
+                    *data = Some(result);
+                    shared.notify.notify_one();
+                    drop(permit);
+                });
             }
         });
+
         QueuedTask { sender }
     }
 }
@@ -216,24 +165,21 @@ mod tests {
 
     #[tokio::test]
     async fn test() {
-        let t = Arc::new(QueuedTaskBuilder::new(10, 2).handle(handle).build());
+        let t = QueuedTaskBuilder::new(10, 2).handle(handle).build();
 
         async fn handle(wait_time: Duration, c: usize) -> usize {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            println!("{} {}", c, wait_time.as_millis());
+            println!("task {} waited {}ms", c, wait_time.as_millis());
             c
         }
 
         let mut ts = vec![];
 
-        for i in 0..20 {
-            let tt = t.clone();
+        for i in 0..10 {
+            let state = t.push(i).await.unwrap();
             ts.push(tokio::spawn(async move {
-                // push task
-                let state = tt.push(i).await.unwrap();
-                // waiting for task result
                 let result = state.wait_result().await;
-                dbg!(result);
+                assert_eq!(result, Some(i));
             }));
         }
 
